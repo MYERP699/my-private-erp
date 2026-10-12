@@ -1,190 +1,200 @@
 import streamlit as st
 import pandas as pd
-import datetime
-from pptx import Presentation
-from pptx.util import Inches, Pt
-import io
+import sqlite3
+from datetime import datetime
 
-# =====================================================================
-# 1. CORE SYSTEM SETUP & BRANDING
-# =====================================================================
-st.set_page_config(page_title="Advanced End-to-End Manufacturing ERP", layout="wide", page_icon="⚙️")
+# --- CONFIGURATION & DATABASE INIT ---
+st.set_page_config(page_title="SAP HANA-Style Warehouse ERP", layout="wide", page_icon="🏭")
 
-# Master Safety Gate Password
-MASTER_PASSWORD = "admin_erp_2026"
+def init_db():
+    conn = sqlite3.connect("warehouse_erp.db")
+    cursor = conn.cursor()
+    # Master Data Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS material_master (
+            material_id TEXT PRIMARY KEY,
+            description TEXT,
+            uom TEXT,
+            safety_stock REAL
+        )
+    """)
+    # Transactional Ledger (SAP Material Ledger style)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS stock_ledger (
+            mov_doc TEXT PRIMARY KEY,
+            posting_date TEXT,
+            material_id TEXT,
+            movement_type TEXT, -- 101: Inward, 201: Outward, 561: Init/Reconcile
+            qty REAL,
+            storage_location TEXT,
+            reference TEXT,
+            user_id TEXT
+        )
+    """)
+    
+    # Insert Dummy Materials if empty
+    cursor.execute("SELECT COUNT(*) FROM material_master")
+    if cursor.fetchone()[0] == 0:
+        materials = [
+            ("MAT-001", "Premium Steel Sheet Gr.5", "PCS", 50.0),
+            ("MAT-002", "Industrial Copper Wire 10mm", "METERS", 200.0),
+            ("MAT-003", "High-Density Polyethylene Resins", "KG", 500.0)
+        ]
+        cursor.executemany("INSERT INTO material_master VALUES (?, ?, ?, ?)", materials)
+        # Initial Stock Upload (SAP Movement Type 561)
+        cursor.execute("INSERT INTO stock_ledger VALUES ('DOC-56101', '2026-10-01', 'MAT-001', '561 (Initial Upload)', 150.0, 'SLOC-01', 'System Migration', 'SAP_BATCH')")
+        cursor.execute("INSERT INTO stock_ledger VALUES ('DOC-56102', '2026-10-01', 'MAT-002', '561 (Initial Upload)', 1200.0, 'SLOC-01', 'System Migration', 'SAP_BATCH')")
+    conn.commit()
+    conn.close()
 
-def check_password():
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if not st.session_state.authenticated:
-        st.title("🔒 Enterprise Manufacturing Execution Portal (MES)")
-        user_pass = st.text_input("Enter Private ERP Master Security Key:", type="password")
-        if st.button("Unlock Enterprise Systems"):
-            if user_pass == MASTER_PASSWORD:
-                st.session_state.authenticated = True
-                st.rerun()
+init_db()
+
+def get_db_connection():
+    return sqlite3.connect("warehouse_erp.db")
+
+# --- CUSTOM SAP HANA CSS STYLE ---
+st.markdown("""
+    <style>
+    .sap-header { background-color: #0a2240; color: white; padding: 15px; border-radius: 5px; margin-bottom: 20px;}
+    .stButton>button { background-color: #0070d2; color: white; border-radius: 4px; }
+    </style>
+""", unsafe_with_html=True)
+
+st.markdown('<div class="sap-header"><h1>SAP HANA Material Management (MM) Dashboard</h1></div>', unsafe_with_html=True)
+
+# --- SIDEBAR NAVIGATION (SAP T-Codes Style) ---
+st.sidebar.image("https://sap.com", width=80)
+st.sidebar.title("SAP Easy Access")
+menu = st.sidebar.radio(
+    "Navigation Menu",
+    ["Dashboard & Analytics", "MIGO - Material Inward", "MB1A - Material Outward", "MI07 - Stock Reconciliation", "MB51 - Stock Ledger Document Search"]
+)
+
+# --- CONTROLLER LOGIC ---
+conn = get_db_connection()
+materials_df = pd.read_sql_query("SELECT * FROM material_master", conn)
+ledger_all = pd.read_sql_query("SELECT * FROM stock_ledger", conn)
+
+# Calculate real-time stock balances 
+# (Movement 101 and 561 add stock; 201 subtracts stock)
+def calculate_current_stock(df):
+    if df.empty:
+        return pd.DataFrame(columns=['material_id', 'Current Stock'])
+    df['signed_qty'] = df.apply(lambda row: -row['qty'] if '201' in row['movement_type'] else row['qty'], axis=1)
+    balances = df.groupby(['material_id', 'storage_location'])['signed_qty'].sum().reset_index()
+    balances.rename(columns={'signed_qty': 'unrestricted_stock'}, inplace=True)
+    return balances
+
+stock_balances = calculate_current_stock(ledger_all)
+
+# --- MODULE 1: DASHBOARD & ANALYTICS ---
+if menu == "Dashboard & Analytics":
+    st.subheader("Global Stock Overview (SAP MM-HANA Live View)")
+    
+    # KPIs
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Material SKUs Active", len(materials_df))
+    col2.metric("Total Warehoused Transactions", len(ledger_all))
+    col3.metric("Storage Locations (SLocs) Tracked", stock_balances['storage_location'].nunique() if not stock_balances.empty else 0)
+    
+    st.write("### Current Unrestricted Stock inventory Balance")
+    display_df = pd.merge(stock_balances, materials_df, on="material_id", how="left")
+    st.dataframe(display_df, use_container_width=True)
+
+# --- MODULE 2: MATERIAL INWARD (MIGO - 101) ---
+elif menu == "MIGO - Material Inward":
+    st.subheader("MIGO - Goods Receipt (Movement Type 101)")
+    
+    with st.form("inward_form", clear_on_submit=True):
+        mat_selection = st.selectbox("Select Material Component", materials_df['material_id'] + " - " + materials_df['description'])
+        mat_id = mat_selection.split(" - ")[0]
+        sloc = st.selectbox("Target Storage Location", ["SLOC-01 (Main Whse)", "SLOC-02 (Cold Storage)", "SLOC-03 (Scrap Yard)"])
+        qty = st.number_input("Receipt Quantity", min_value=0.1, step=1.0)
+        ref = st.text_input("Purchase Order (PO) / Delivery Note Ref Code")
+        submit = st.form_submit_button("Post Goods Receipt (101)")
+        
+        if submit:
+            doc_id = f"DOC-101{int(datetime.now().timestamp())}"
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO stock_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (doc_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mat_id, "101 (Goods Receipt)", qty, sloc.split(" ")[0], ref, "SAP_USER_MM")
+            )
+            conn.commit()
+            st.success(f"Success: Material Document {doc_id} posted successfully under Movement Type 101.")
+
+# --- MODULE 3: MATERIAL OUTWARD (MB1A - 201) ---
+elif menu == "MB1A - Material Outward":
+    st.subheader("MB1A - Goods Issue for Consumption (Movement Type 201)")
+    
+    with st.form("outward_form", clear_on_submit=True):
+        mat_selection = st.selectbox("Select Material Component", materials_df['material_id'] + " - " + materials_df['description'])
+        mat_id = mat_selection.split(" - ")[0]
+        sloc = st.selectbox("Source Storage Location", ["SLOC-01 (Main Whse)", "SLOC-02 (Cold Storage)", "SLOC-03 (Scrap Yard)"])
+        qty_to_issue = st.number_input("Issue Quantity", min_value=0.1, step=1.0)
+        ref = st.text_input("Cost Center / Production Order Document Target")
+        submit = st.form_submit_button("Post Goods Issue (201)")
+        
+        if submit:
+            # Check current inventory balance constraints
+            match = stock_balances[(stock_balances['material_id'] == mat_id) & (stock_balances['storage_location'] == sloc.split(" ")[0])]
+            available = match['unrestricted_stock'].values[0] if not match.empty else 0.0
+            
+            if qty_to_issue > available:
+                st.error(f"SAP Deficit Error: Goods Issue aborted. Requested quantity exceeds current available stock ({available} remaining).")
             else:
-                st.error("Invalid Security Key. Access Revoked.")
-        return False
-    return True
+                doc_id = f"DOC-201{int(datetime.now().timestamp())}"
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO stock_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (doc_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mat_id, "201 (Goods Issue)", qty_to_issue, sloc.split(" ")[0], ref, "SAP_USER_MM")
+                )
+                conn.commit()
+                st.success(f"Success: Material Document {doc_id} generated. Stock updated downstream.")
 
-if check_password():
-    # =====================================================================
-    # 2. STATE DATA REGISTRIES (Simulated Central Cloud Relational Database)
-    # =====================================================================
-    # RM/PM Inventory Ledger
-    if "inventory_db" not in st.session_state:
-        st.session_state.inventory_db = pd.DataFrame([
-            {"Material Code": "RM-STEEL-01", "Material Name": "Premium Structural Steel", "Type": "Raw Material (RM)", "Stock Qty": 1000, "Unit": "Kgs"},
-            {"Material Code": "PM-BOX-05", "Material Name": "Industrial Storage Pallet Boxes", "Type": "Packing Material (PM)", "Stock Qty": 150, "Unit": "Pcs"},
-            {"Material Code": "RM-ALUM-02", "Material Name": "Tempered Aluminum Sheeting", "Type": "Raw Material (RM)", "Stock Qty": 500, "Unit": "Sheets"}
-        ])
-
-    # Purchase Orders (PO) Registry
-    if "po_db" not in st.session_state:
-        st.session_state.po_db = pd.DataFrame([
-            {"PO Number": "PO-2026-001", "Vendor": "Apex Metal Forges", "Material Code": "RM-STEEL-01", "Ordered Qty": 500, "Status": "Open"}
-        ])
-
-    # GRN Logs
-    if "grn_db" not in st.session_state:
-        st.session_state.grn_db = pd.DataFrame([
-            {"GRN Number": "GRN-9901", "PO Reference": "PO-2026-001", "Date": "2026-09-20", "Received Qty": 500, "Inspected Status": "Accepted"}
-        ])
-
-    # Bill of Materials (BOM) Recipes
-    if "bom_db" not in st.session_state:
-        st.session_state.bom_db = pd.DataFrame([
-            {"Finished Good": "Heavy Duty Steel Chassis", "Component Code": "RM-STEEL-01", "Qty Required": 5, "Component Unit": "Kgs"},
-            {"Finished Good": "Heavy Duty Steel Chassis", "Component Code": "PM-BOX-05", "Qty Required": 1, "Component Unit": "Pcs"}
-        ])
-
-    # Production Batches
-    if "batch_db" not in st.session_state:
-        st.session_state.batch_db = pd.DataFrame([
-            {"Batch ID": "B-BATCH-101", "Target Product": "Heavy Duty Steel Chassis", "Batch Target Qty": 20, "Status": "Issued & Released"}
-        ])
-
-    # Quality Assurance & Output Yield logs
-    if "production_output_db" not in st.session_state:
-        st.session_state.production_output_db = pd.DataFrame([
-            {"Batch ID": "B-BATCH-101", "Produced Qty": 18, "Rejected Qty": 2, "Calculated Yield": "90.0%"}
-        ])
-
-    # Sales Invoices & Dispatches Registry
-    if "sales_db" not in st.session_state:
-        st.session_state.sales_db = pd.DataFrame([
-            {"Invoice ID": "INV-5501", "Client Account": "Titan Logistics Corp", "Product Dispatched": "Heavy Duty Steel Chassis", "Shipped Qty": 10, "Revenue Realized ($)": 4500.00}
-        ])
-
-    # Finished Goods Inventory tracking
-    if "fg_inventory" not in st.session_state:
-        st.session_state.fg_inventory = {"Heavy Duty Steel Chassis": 8}
-
-    # =====================================================================
-    # 3. INTERACTIVE NAVIGATION SIDEBAR
-    # =====================================================================
-    st.sidebar.title("🏭 Factory Operations Management")
-    module = st.sidebar.radio("Select Processing Phase:", [
-        "📊 Master Executive Overview",
-        "1️⃣ Procurement & Purchase Orders",
-        "2️⃣ Inward Logistics & GRN",
-        "3️⃣ Master BOM Configuration",
-        "4️⃣ Batch Issuance & Material Release",
-        "5️⃣ Production Output & Yield Engine",
-        "6️⃣ Dispatches & Sales Invoices"
-    ])
-
-    # =====================================================================
-    # MODULE: EXECUTIVE OVERVIEW & MASTER REPORTING
-    # =====================================================================
-    if module == "📊 Master Executive Overview":
-        st.title("📊 Master Executive Overview Dashboard")
-        st.write(f"System State Synchronized Live on: **{datetime.date.today()}**")
-        st.markdown("---")
+# --- MODULE 4: STOCK RECONCILIATION (MI07) ---
+elif menu == "MI07 - Stock Reconciliation":
+    st.subheader("MI07 - Physical Inventory Difference Posting")
+    st.info("This interface aligns physical floor count discrepancies by auto-calculating delta movement postings.")
+    
+    with st.form("recon_form", clear_on_submit=True):
+        mat_selection = st.selectbox("Select Target Material", materials_df['material_id'] + " - " + materials_df['description'])
+        mat_id = mat_selection.split(" - ")[0]
+        sloc = st.selectbox("Target Storage Location Slot", ["SLOC-01", "SLOC-02", "SLOC-03"])
+        physical_count = st.number_input("Actual Book-Count Found physically on Floor", min_value=0.0, step=1.0)
+        ref = st.text_input("Audit Batch ID / Discrepancy Reason Statement")
+        submit = st.form_submit_button("Post Inventory Correction Document")
         
-        # Display operational status tickers
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Open Purchase Orders", f"{len(st.session_state.po_db[st.session_state.po_db['Status'] == 'Open'])} Active")
-        k2.metric("Active Work Batches", f"{len(st.session_state.batch_db[st.session_state.batch_db['Status'] == 'Issued & Released'])} Running")
-        
-        all_sales_revenue = st.session_state.sales_db["Revenue Realized ($)"].sum()
-        k3.metric("Gross Invoiced Sales", f"${all_sales_revenue:,.2f}")
-        
-        total_p = st.session_state.production_output_db["Produced Qty"].sum()
-        total_r = st.session_state.production_output_db["Rejected Qty"].sum()
-        plant_yield = (total_p / (total_p + total_r) * 100) if (total_p + total_r) > 0 else 100.0
-        k4.metric("Average Shop Floor Yield", f"{plant_yield:.1f}%")
+        if submit:
+            match = stock_balances[(stock_balances['material_id'] == mat_id) & (stock_balances['storage_location'] == sloc)]
+            book_qty = match['unrestricted_stock'].values[0] if not match.empty else 0.0
+            variance = physical_count - book_qty
+            
+            if variance == 0:
+                st.info("Zero delta variance identified. Database alignment unnecessary.")
+            else:
+                mov_type = "701 (Physical Gain)" if variance > 0 else "702 (Physical Loss)"
+                doc_id = f"DOC-MI07{int(datetime.now().timestamp())}"
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO stock_ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (doc_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mat_id, mov_type, abs(variance), sloc, f"Variance Balance Fix: {ref}", "SAP_AUDITOR")
+                )
+                conn.commit()
+                st.success(f"Inventory Adjusted! Material Document {doc_id} created with movement adjustment flag {mov_type} for absolute variance of {abs(variance)} units.")
 
-        st.markdown("---")
-        col_left, col_right = st.columns(2)
-        with col_left:
-            st.subheader("📦 Live RM/PM Stocks")
-            st.dataframe(st.session_state.inventory_db, use_container_width=True, hide_index=True)
-        with col_right:
-            st.subheader("🏆 Vaulted Finished Goods Available for Sale")
-            for product, qty in st.session_state.fg_inventory.items():
-                st.info(f"**{product}**: {qty} Units available in Finished Goods Warehouse.")
-
-        st.markdown("---")
-        st.subheader("💼 Compile Presentations")
-        if st.button("🚀 Auto-Generate PowerPoint Operational Report"):
-            prs = Presentation()
-            slide_layout = prs.slide_layouts
-            
-            # Slide 1: Main Title
-            s1 = prs.slides.add_slide(slide_layout)
-            s1.shapes.title.text = "Operational Manufacturing Execution Report"
-            s1.placeholders.text = f"Data Analytics Period: {datetime.date.today()}"
-            
-            # Slide 2: Data Metrics Text Box
-            s2 = prs.slides.add_slide(slide_layout)
-            s2.shapes.title.text = "Key Operational Throughput Metrics"
-            tb = s2.shapes.add_textbox(Inches(0.5), Inches(2.0), Inches(9), Inches(4)).text_frame
-            tb.word_wrap = True
-            tb.paragraphs.text = f"• Total Factory Yield Rate Calculated: {plant_yield:.2f}%"
-            tb.add_paragraph().text = f"• Gross Financial Revenue Invoiced: ${all_sales_revenue:,.2f}"
-            tb.add_paragraph().text = f"• Total System Logged Purchase Orders: {len(st.session_state.po_db)} Registered"
-            
-            # Slide 3: Tabular Breakdown of Stock
-            s3 = prs.slides.add_slide(slide_layout)
-            s3.shapes.title.text = "Current Raw Supply Balances"
-            df_e = st.session_state.inventory_db
-            r, c = len(df_e) + 1, len(df_e.columns)
-            table_shape = s3.shapes.add_table(r, c, Inches(0.5), Inches(1.8), Inches(9), Inches(3))
-            tbl = table_shape.table
-            for j, col_n in enumerate(df_e.columns):
-                tbl.cell(0, j).text = str(col_n)
-            for i, r_data in df_e.iterrows():
-                for j, val in enumerate(r_data):
-                    tbl.cell(i+1, j).text = str(val)
-            
-            buf = io.BytesIO()
-            prs.save(buf)
-            buf.seek(0)
-            st.download_button(label="📥 Download Executive Presentation", data=buf, file_name="Operations_Executive_Review.pptx")
-
-    # =====================================================================
-    # 1. PROCUREMENT & PURCHASE ORDERS
-    # =====================================================================
-    elif module == "1️⃣ Procurement & Purchase Orders":
-        st.title("1️⃣ Purchase Order (PO) Engine")
-        st.write("Authorize external purchase commitments for RM/PM materials to registered vendors.")
+# --- MODULE 5: STOCK LEDGER SEARCH (MB51) ---
+elif menu == "MB51 - Stock Ledger Document Search":
+    st.subheader("MB51 - Material Document Audit Trail Ledger")
+    
+    search_query = st.text_input("Filter Ledger Logs by Material Code / Document ID / Mov Type Key").strip()
+    
+    if search_query:
+        filtered_df = ledger_all[
+            ledger_all['material_id'].str.contains(search_query, case=False) |
+            ledger_all['mov_doc'].str.contains(search_query, case=False) |
+            ledger_all['movement_type'].str.contains(search_query, case=False)
+        ]
+    else:
+        filtered_df = ledger_all
         
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            st.subheader("Generate Fresh PO")
-            with st.form("po_form", clear_on_submit=True):
-                po_id = f"PO-2026-{len(st.session_state.po_db) + 1:03d}"
-                st.warning(f"Drafting Reference Number: {po_id}")
-                v_name = st.text_input("Target Vendor/Supplier Name", placeholder="e.g., Nippon Steel Corp")
-                m_code = st.selectbox("Select Target Material Code", st.session_state.inventory_db["Material Code"].tolist())
-                o_qty = st.number_input("Purchase Commitment Quantity", min_value=1, value=100)
-                
-                if st.form_submit_button("Authorize & Release Purchase Order"):
-                    if v_name:
-                        new_p = {"PO Number": po_id, "Vendor": v_name, "Material Code": m_code, "Ordered Qty": o_qty, "Status": "Open"}
-                        st.session_state.po_db = pd.concat([st.session_state.po_db, pd.DataFrame([new_p])], ignore_index=True)
-                        st.success(f"PO {po_id} has been formally released to {v_name}!")
-                        st.rerun()
-                    else:
